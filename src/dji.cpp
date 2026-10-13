@@ -217,9 +217,14 @@ void loop() {
 
 bool ready() { return state == kReady; }
 
+// Status 0x03 with the record time running. Not 0x05: that is the armed pre-rec buffer, where the
+// record time counts buffered seconds. The camera also shows 0x03 with time 0 for one push when it
+// starts pre-rec and when a recording stops, so time 0 doesn't count (a real start shows it ~1 s late).
 // ponytail: 0x03 also means "taking a photo", so photo mode (0x05) is excluded; other photo-type
-// modes would read as recording.
-bool recording() { return ready() && (status.state == 0x03 || status.state == 0x05) && status.mode != 0x05; }
+// modes would read as recording if their record time runs.
+bool recording() {
+  return ready() && status.state == 0x03 && status.recordTime > 0 && status.mode != 0x05;
+}
 
 void record(bool start) {
   if (!ready()) return;

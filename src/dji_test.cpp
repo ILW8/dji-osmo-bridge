@@ -22,7 +22,8 @@ void loop() {
   if (s.updates != last.updates && (s.mode != last.mode || s.state != last.state ||
                                     s.battery != last.battery || s.recordTime != last.recordTime)) {
     Serial.printf("camera: mode 0x%02x, status 0x%02x, battery %u%%, record time %u s%s\n", s.mode,
-                  s.state, s.battery, s.recordTime, dji::recording() ? " (RECORDING)" : "");
+                  s.state, s.battery, s.recordTime,
+                  dji::recording() ? " (RECORDING)" : s.state == 0x05 ? " (PRE-REC)" : "");
   }
   last = s;
 

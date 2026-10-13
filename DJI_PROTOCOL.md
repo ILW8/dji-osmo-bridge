@@ -222,6 +222,11 @@ For full-frame offsets, add 14. Struct in `protocol/dji_protocol_data_structures
 - **Tested** (payload at least 38 bytes, battery at byte 37 correct): Video is mode 0x01, SuperNight
   is 0x28, idle is status 0x01. While recording, status is 0x03 and record_time counts up once a
   second. After a stop, status stays 0x03 for about 1 s (record_time drops to 0) and then returns to 0x01.
+- **Pre-rec (tested):** status 0x05 means the pre-recording buffer is armed. Entering it shows
+  0x03 with record_time 0 for one push, then 0x05. record_time counts the buffered seconds up to the
+  configured length (60 s here) and stays there. The shutter switches 0x05 straight to 0x03, and
+  record_time carries on from the buffer (60, 61, …). On stop the camera goes 0x03 (time 0) → 0x01
+  → 0x03 (time 0) → 0x05, back to pre-rec. So "recording" = 0x03 with record_time > 0.
 - **Payload length:** older Action 4 firmware sent only 31 payload bytes (issue #5). Read byte 37
   only when the payload is at least 38 bytes.
 - The demo parses the battery field but never uses it.
@@ -255,12 +260,17 @@ CmdSet 0x1D, CmdID 0x03, CmdType 0x01 (as in the demo), 9-byte payload
   2 execution failed, 0xFF undefined) + reserved[4].
 - **Tested:** device_id `00 00 FF 33` (the demo's) works. The reply is a response frame with the
   same SEQ, non-zero reserved header bytes and a **1-byte payload** (no reserved[4]). Start and stop
-  both return ret_code 0x00. A start with no SD card in the camera returns **0xD6**, an undocumented code.
+  both return ret_code 0x00. Undocumented codes:
+  - **0xD6:** start with no SD card in the camera.
+  - **0xD9:** stop while not recording (seen with pre-rec armed). Nothing changes; pre-rec stays armed.
 
   ```
   ok:    AA 13 00 20 00 41 40 31 08 00 7D BC 1D 03 00 AE 8F 26 B1
   no SD: AA 13 00 20 00 41 40 31 03 00 7A 8C 1D 03 D6 04 88 9A 9E
   ```
+- **With pre-rec armed (tested):** start works like the shutter button. It keeps the buffer
+  (record_time carries on from 60) and returns 0x00. Stop during that recording returns 0x00, and
+  the camera goes back to pre-rec. So the bridge can pass start and stop through unchanged.
 
 Frames computed with the demo's CRC code (SEQ 1; not captured from a camera):
 
