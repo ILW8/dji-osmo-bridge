@@ -171,70 +171,18 @@ assigned over ANT+: no BLE service maps to them, and `0xCC01` Magene is not in t
 
 ## Camera side (researched, not built)
 
-Protocol: DJI's open "R SDK" BLE protocol, as used by
-[dji-sdk/Osmo-GPS-Controller-Demo](https://github.com/dji-sdk/Osmo-GPS-Controller-Demo)
-(commit `92fe23e`, docs in `docs/protocol*.md`). The Action 5 Pro is supported (device ID `0xFF44`,
-model `0x0015`). A DJI maintainer confirmed this, and issue #5 has real Action 5 Pro logs.
+The full protocol is in **[DJI_PROTOCOL.md](DJI_PROTOCOL.md)**: frame format and CRCs, transport rules,
+pairing, the `1D02` status push, `1D03` record, sleep and wake-up, references, unverified points, and the
+bridge plan.
 
-- **GATT:** service `0xFFF0`. Notify `0xFFF4` (camera → remote), write `0xFFF5` (remote → camera).
-  Enable notify on `0xFFF4`. Ignore frames that do not start with `0xAA`: DUML `0x55` frames arrive
-  on the same characteristic.
-- **Frame:** `AA`, ver/len u16 LE (bits 9..0 = total length including CRC32), CmdType (bits 4..0 = reply
-  needed: 0 none, 1 optional, 2+ required; bit 5 = response), ENC 0, RES 3 bytes, SEQ u16, CRC16,
-  CmdSet, CmdID, payload, CRC32. All fields are little-endian.
-  - CRC16 covers bytes 0–9: CRC-16/ARC (poly 0x8005 reflected), **init `0x3AA3`**.
-  - CRC32 covers bytes 0 through the end of the payload: poly 0x04C11DB7 reflected, **init `0x00003AA3`**,
-    no final XOR.
-  - A reply echoes the sender's SEQ. Do not validate RES: the camera sends non-zero RES bytes.
-  - Check frame: `AA 1B 00 01 00 00 00 00 05 00 57 EE 1D 04 00 00 33 FF 0A 01 47 39 36 F4 FA E1 D0`.
-- **One frame per ATT write or notification.** The camera rejects frames split into 20-byte chunks.
-  Set a large MTU before connecting; the demo uses 500, and frames are up to 114 bytes.
-- **Pairing:** done in the protocol, no BLE bonding.
-  1. Scan for manufacturer data `AA 08 15 00 FA <MAC>`.
-  2. Connect, enable notify, wait about 2 s.
-  3. Send connect request `00/19` (CmdType 2): own device_id u32, mac_len 6, mac[16], fw 0, conidx 0,
-     verify_mode (1 = force the code pop-up, 0 = let the camera decide), verify_data (random 0–9999),
-     reserved[4].
-  4. The camera replies (`0x20`). **The first time, the user taps Accept on the camera.**
-  5. The camera then sends its own `00/19` with verify_mode 2 and verify_data 0 = accepted.
-  6. Acknowledge it with the camera's SEQ.
+In short: the Action 5 Pro speaks DJI's open "R SDK" BLE protocol. Battery % is byte 37 of the `1D02`
+status push, recording state is byte 1, and `1D03` starts and stops recording. Pairing happens inside
+the protocol: the user taps Accept on the camera once. Each frame must fit in one BLE packet, so the
+bridge needs a large MTU to the camera. The ESP32 must be a BLE central (to the camera) and a
+peripheral (to the ELEMNT) at the same time.
 
-  Keep device_id and mac constant (store them in NVS). Reconnects with verify_mode 0 are then silent.
-- **Status:** subscribe with `1D/05` (push_mode 3, push_freq 20 = 2 Hz plus pushes on change).
-  The camera then sends `1D/02`. Payload offsets:
-
-  | Offset | Field | Values |
-  |---|---|---|
-  | 0 | mode | 0x01 video, 0x05 photo, … |
-  | 1 | status | **0x03 recording or photo**, 0x05 pre-recording, 0x01 idle |
-  | 5–6 | record_time | seconds |
-  | 23–26 | remaining time | seconds |
-  | 28 | power_mode | 3 = sleep |
-  | **37** | **battery %** | |
-
-  Read byte 37 only when the payload is at least 38 bytes: old firmware sent 31.
-  A real frame showed `0x43` = 67%.
-- **Record:** `1D/03`, payload device_id u32 (the demo uses `0x33FF0000`; it is probably not checked),
-  record_ctrl (0 = start, 1 = stop), reserved[4].
-  The camera's reply to `1D/03` was never captured. Whether "start" in photo mode takes a photo is
-  unknown; `1D/04` switches mode.
-- **Limits:**
-  - One controller at a time: the Mimo app is probably locked out while the bridge is connected.
-  - Sleep keeps the BLE link up. Wake-up drops it briefly, and the bridge must reconnect.
-  - Auto power-off ends BLE and cannot be undone over BLE.
-  - Wake from sleep: advertise `0A FF 57 4B 50 <camera MAC reversed>` (ADV_IND) for about 2 s. On a
-    classic ESP32 this replaces the GoPro advertising for that time.
-- **References:**
-  - [KonradIT/osmosis](https://github.com/KonradIT/osmosis) (MIT; `RsdkProtocol.kt` is a compact, tested
-    port).
-  - [rhoenschrat/DJI-Remote](https://github.com/rhoenschrat/DJI-Remote) (MIT, classic ESP32).
-  - theserialhobbyist/M5StickCPlus2_Remote_For_DJI_Osmo (ESP-IDF, Action 5 Pro).
-
-  DJI's demo is ESP-IDF 5.5 under a mixed license (EULA + MIT). One author reports that Arduino BLE
-  libraries had unnamed problems with this protocol, so test that early.
-- The ESP32 must be a BLE central (to the camera) and a peripheral (to the ELEMNT) at the same time.
-- Next step: an Osmo-only test sketch as a second PlatformIO environment. It pairs, logs battery and
-  recording state from `1D02`, and records or stops from serial. Merge it with the GoPro bridge after that.
+Next step: an Osmo-only test sketch as a second PlatformIO environment (step 1 of the plan in
+DJI_PROTOCOL.md). Merge it with the GoPro bridge after that.
 - A Karoo extension already exists: [derFrisson/Karoo-DJI-Osmo-extension](https://github.com/derFrisson/Karoo-DJI-Osmo-extension) (early stage). It is only relevant if switching head units.
 
 ## Gotchas
