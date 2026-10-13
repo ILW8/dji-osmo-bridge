@@ -1,8 +1,8 @@
 # DJI Osmo Action 5 Pro: BLE protocol notes
 
-Research notes for connecting the ESP32 bridge to the camera as a BLE central. Status as of 2026-10-13.
-Nothing here has been tested on our hardware yet. Items marked **unverified** come from no source,
-or from one source only.
+Research notes for connecting the ESP32 bridge to the camera as a BLE central. Status as of 2026-10-14.
+Items marked **tested** were seen on our Action 5 Pro with `src/dji_test.cpp` (2026-10-14).
+Items marked **unverified** come from no source, or from one source only.
 
 The camera speaks DJI's open "R SDK" BLE protocol. It gives everything the bridge needs:
 
@@ -95,6 +95,14 @@ characteristic. DJI says to ignore anything that does not start with `0xAA` (`do
 - Arduino-ESP32: `BLEClient` sends an MTU request on connect. Call `BLEDevice::setMTU(500)`
   before connecting.
 
+**Arduino-ESP32 2.0.17 quirks (tested).** These are probably the "quirks" the M5Stick author meant:
+- On the first connection after boot, `BLEClient` skips its MTU request: its connect-event handler
+  compares against a connection ID that is only set later. The link stays at MTU 23 and every
+  camera frame arrives cut off at 20 bytes. Fix: call `client->setMTU(500)` after `connect()`.
+- `BLERemoteCharacteristic::writeValue()` blocks until the write's completion event, even for
+  Write Command. That deadlocks in a notify callback, and it hung in `loop()` while the camera was
+  sending notifications fast. Fix: call `esp_ble_gattc_write_char()` directly; it only queues.
+
 ## Connecting and pairing
 
 Sources: `logic/connect_logic.c`, `docs/protocol_data_segment.md`, the issue #5 logs.
@@ -138,6 +146,7 @@ Sources: `logic/connect_logic.c`, `docs/protocol_data_segment.md`, the issue #5 
    ```
 
    The camera may send this response or its own command (step 8) first. Handle either order.
+   **Tested:** our camera sent exactly this payload.
 7. **First pairing only:** the camera shows the code. The user taps Accept.
 8. **The camera sends its own `0x0019` command** (CmdType 0x02) with verify_mode = 2 and
    verify_data = 0 (accepted) or 1 (rejected). The demo waits up to 30 s for it. Action 5 Pro capture:
@@ -149,6 +158,9 @@ Sources: `logic/connect_logic.c`, `docs/protocol_data_segment.md`, the issue #5 
 9. **Acknowledge it** with a `0x0019` response frame (CmdType 0x20) that uses the **camera's SEQ**.
    Payload: own device_id, ret_code 0, reserved[0] = camera number (0 for a single camera).
    If the camera rejected the pairing, disconnect and do not retry during that scan.
+   **Tested:** the camera repeats its command about 50 times a second, with a new SEQ each time,
+   until this response arrives. A Write Command with a 9-byte payload (all zero except device_id)
+   is enough.
 10. Optionally query the version (CmdSet 0x00, CmdID 0x00). Then subscribe to status (`1D05`, below).
 
 **Bonding:**
@@ -170,7 +182,7 @@ Sources: `logic/connect_logic.c`, `docs/protocol_data_segment.md`, the issue #5 
 - push_mode 3 = periodic, plus a push whenever the status changes.
 - push_freq must be 20 (fixed 2 Hz).
 - The demo sends it with CmdType 0x00 (`logic/status_logic.c`).
-- The camera acknowledges with a 0x20 frame `1D 05 00 00 00 00 00` (issue #5).
+- The camera acknowledges with a 0x20 frame `1D 05 00 00 00 00 00` (issue #5; **tested**).
 
 Computed subscribe frame:
 
@@ -207,6 +219,9 @@ For full-frame offsets, add 14. Struct in `protocol/dji_protocol_data_structures
 
 - **Recording test:** camera_status is 0x03 or 0x05 (`logic/status_logic.c`). 0x03 also covers
   taking a photo, so also check that camera_mode is a video mode, or that record_time is counting up.
+- **Tested** (payload at least 38 bytes, battery at byte 37 correct): Video is mode 0x01, SuperNight
+  is 0x28, idle is status 0x01. While recording, status is 0x03 and record_time counts up once a
+  second. After a stop, status stays 0x03 for about 1 s (record_time drops to 0) and then returns to 0x01.
 - **Payload length:** older Action 4 firmware sent only 31 payload bytes (issue #5). Read byte 37
   only when the payload is at least 38 bytes.
 - The demo parses the battery field but never uses it.
@@ -215,7 +230,7 @@ For full-frame offsets, add 14. Struct in `protocol/dji_protocol_data_structures
 Real Action 5 Pro frame from issue #5 (mode 0x05 Photo, status 0x03, battery 0x43 = 67 %):
 
 ```
-AA 38 00 01 00 52 2A 00 E5 D2 A2 96 1D 02 | 05 03 03 01 00 00 00 00 01 00 00 00 00 00 00 A8 DB 01 00 B2 4C 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 43 | 79 B7 7F D9
+AA 38 00 01 00 52 2A 00 E5 D2 A2 96 1D 02 | 05 03 03 01 00 00 00 00 01 00 00 00 00 00 00 A8 DB 01 00 B2 4C 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 43 | 79 B7 7F D9
 ```
 
 **`1D06` (new-style status push):** the mode name and parameters as ASCII. No battery or
@@ -237,7 +252,15 @@ CmdSet 0x1D, CmdID 0x03, CmdType 0x01 (as in the demo), 9-byte payload
   0xFF440000 (camera ID << 16), and the docs' example uses `00 00 33 FF`. This suggests the camera
   does not check it. **Unverified.**
 - Reply (per the docs): a response frame with the same SEQ. Payload: ret_code (0 ok, 1 parse error,
-  2 execution failed, 0xFF undefined) + reserved[4]. **No captured reply exists in any source.**
+  2 execution failed, 0xFF undefined) + reserved[4].
+- **Tested:** device_id `00 00 FF 33` (the demo's) works. The reply is a response frame with the
+  same SEQ, non-zero reserved header bytes and a **1-byte payload** (no reserved[4]). Start and stop
+  both return ret_code 0x00. A start with no SD card in the camera returns **0xD6**, an undocumented code.
+
+  ```
+  ok:    AA 13 00 20 00 41 40 31 08 00 7D BC 1D 03 00 AE 8F 26 B1
+  no SD: AA 13 00 20 00 41 40 31 03 00 7A 8C 1D 03 D6 04 88 9A 9E
+  ```
 
 Frames computed with the demo's CRC code (SEQ 1; not captured from a camera):
 
@@ -309,16 +332,17 @@ Notes:
 - **Cleaner references:** [rhoenschrat/DJI-Remote](https://github.com/rhoenschrat/DJI-Remote) (MIT),
   [KonradIT/osmosis](https://github.com/KonradIT/osmosis) (MIT; `RsdkProtocol.kt` is a compact,
   tested port of the framing, CRCs and payloads), node-osmo (MIT), djictl (CC0), AeroCam (GPLv3).
-- **Risk:** the M5Stick author says Arduino BLE libraries "had quirks that made them incompatible
-  with the DJI protocol" ([blog post](https://serialhobbyism.com/open-source-diy-remote-for-dji-osmo-action-5-pro-cameras)),
-  without details. Test this first.
+- **Risk (resolved):** the M5Stick author says Arduino BLE libraries "had quirks that made them
+  incompatible with the DJI protocol" ([blog post](https://serialhobbyism.com/open-source-diy-remote-for-dji-osmo-action-5-pro-cameras)),
+  without details. Two such quirks and their fixes are under Transport rules; after the fixes,
+  Arduino BLE works.
 - **Other repos checked:** node-osmo is DUML only (Mimo-style pairing, Wi-Fi, streaming, battery;
   no record control). djictl targets the Pocket 3 and its BLE battery command is marked as not
   working. xaionaro/reverse-engineering-dji has Pocket 3 captures only.
 
 ## Unverified
 
-- The camera's actual reply bytes for `1D03`, and whether its device_id field matters.
+- Whether `1D03`'s device_id field matters (the demo's value works).
 - Whether a `1D03` start in Photo mode takes a photo.
 - Minimum Action 5 Pro firmware.
 - The exact `1D02` push rate.
@@ -331,9 +355,9 @@ Notes:
 
 ## Plan for the bridge
 
-1. Test sketch, camera side only. Connect as a central with MTU 500, pair with Accept, subscribe
-   to `1D02`, and log battery, mode and recording state. Start and stop recording from serial
-   commands.
+1. **Done (2026-10-14):** test sketch, camera side only (`src/dji_test.cpp`, `pio run -e dji-test`).
+   Connect as a central with MTU 500, pair with Accept, subscribe to `1D02`, and log battery, mode
+   and recording state. Start and stop recording from serial commands.
 2. Merge with the GoPro side:
    - ELEMNT `SHUTTER on/off` → `1D03` start/stop.
    - `1D02` battery → GoPro status 70 and `0x2A19`.
