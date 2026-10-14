@@ -43,8 +43,12 @@ void logGatt(esp_gatts_cb_event_t event, esp_gatt_if_t, esp_ble_gatts_cb_param_t
   }
 }
 
-// Debug: connection parameter changes, for both links.
+// Debug: advertising that fails to start or stop, and connection parameter changes, both links.
 void logGap(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *p) {
+  if (event == ESP_GAP_BLE_ADV_START_COMPLETE_EVT && p->adv_start_cmpl.status)
+    Serial.printf("advertising on FAILED (status %d)\n", p->adv_start_cmpl.status);
+  if (event == ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT && p->adv_stop_cmpl.status)
+    Serial.printf("advertising off FAILED (status %d)\n", p->adv_stop_cmpl.status);
   if (event != ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT) return;
   auto &u = p->update_conn_params;
   Serial.printf("link %s: interval %u.%02u ms, latency %u, timeout %u ms (status %d)\n",
@@ -377,6 +381,19 @@ void setup() {
 
 void loop() {
   dji::loop();
+
+  // Restart our advertising every 5 s while the ELEMNT is away. After the bridge dropped a sleeping
+  // camera, nothing could see or connect to the bridge until a reset, though advertising had
+  // started fine (5 times, also with esp_ble_gap_disconnect). After a pulled camera battery, it
+  // could. Likely: the camera, alive, connects back to the bridge (DJI's wake-up wants connectable
+  // advertising) and never follows through, which ends advertising in the controller unnoticed.
+  // ponytail: a guess at the cause; this restart is the cure either way if the bridge comes back.
+  static uint32_t advAt = 0;
+  if (!elemnt && !dji::waking() && millis() - advAt > 5000) {
+    advAt = millis();
+    BLEDevice::getAdvertising()->stop();
+    BLEDevice::startAdvertising();
+  }
 
   static bool wasWaking = false;
   if (wasWaking && !dji::waking()) {  // the camera's wake-up advertisement is over: ours again
