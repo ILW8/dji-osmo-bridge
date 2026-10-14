@@ -8,6 +8,7 @@
 #include <BLEServer.h>
 #include <BLESecurity.h>
 #include <BLE2902.h>
+#include <mutex>
 #include "dji.h"
 
 // Name and advertisement copy a real GoPro (Open GoPro test vectors). The ELEMNT lists a GoPro only
@@ -16,6 +17,8 @@ const char *kName = "GoPro 0042";  // "GoPro" + last 4 digits of the serial, as 
 // ponytail: shown until the camera's first status push; hide the GoPro until then if it misleads.
 uint8_t level = 42;
 bool statusPush = false;  // the ELEMNT registered for status updates (query 0x53)
+bool elemnt = false;      // the ELEMNT is connected
+BLEAdvertisementData advData;  // kept to set it again after the camera's wake-up advertisement
 BLECharacteristic *battery, *cmd, *cmdRsp, *set, *setRsp, *qry, *qryRsp;
 BLE2902 *batteryCccd;
 
@@ -30,7 +33,21 @@ void logGatt(esp_gatts_cb_event_t event, esp_gatt_if_t, esp_ble_gatts_cb_param_t
     Serial.println();
   } else if (event == ESP_GATTS_MTU_EVT) {
     Serial.printf("GATT mtu %u\n", p->mtu.mtu);
+  } else if (event == ESP_GATTS_CONGEST_EVT) {
+    Serial.printf("GATT conn %u %s\n", p->congest.conn_id,
+                  p->congest.congested ? "congested" : "no longer congested");
+  } else if (event == ESP_GATTS_RESPONSE_EVT && p->rsp.status != ESP_GATT_OK) {
+    Serial.printf("GATT response for handle %u FAILED (0x%02x)\n", p->rsp.handle, p->rsp.status);
   }
+}
+
+// Debug: connection parameter changes, for both links.
+void logGap(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *p) {
+  if (event != ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT) return;
+  auto &u = p->update_conn_params;
+  Serial.printf("link %s: interval %u.%02u ms, latency %u, timeout %u ms (status %d)\n",
+                BLEAddress(u.bda).toString().c_str(), u.conn_int * 5 / 4, u.conn_int * 125 % 100,
+                u.latency, u.timeout * 10, u.status);
 }
 
 BLEUUID gp(uint16_t id) {  // Open GoPro characteristic UUIDs: b5f9xxxx-aa8d-11e3-9046-0002a5d5c51b
@@ -44,7 +61,14 @@ BLEUUID gp(uint16_t id) {  // Open GoPro characteristic UUIDs: b5f9xxxx-aa8d-11e
 // the 13-bit header: the ELEMNT only reassembles packets when the first byte has 0x20 or 0x80 set,
 // and parses a split message with the 5-bit header as its first packet alone.
 // ponytail: fixed 20-byte packets fit the default MTU; use the negotiated MTU if throughput matters.
+// notify() drops a packet when the link is congested ("rc=-1" in the log), as in the ELEMNT's burst
+// of requests after connecting. Not retried: the ELEMNT asks again for a reply it doesn't get. A
+// retry kept the link congested, and then the stack dropped one of its own read or write responses
+// (most likely), and the ELEMNT waited for it forever: connected, but it sent nothing more.
+std::mutex sending;  // replies go out from the Bluetooth task, status pushes from loop()
+
 void send(BLECharacteristic *c, const uint8_t *msg, size_t n) {
+  std::lock_guard<std::mutex> lock(sending);
   uint8_t pkt[20];
   size_t len;
   if (n < sizeof pkt) {  // fits in one packet with the 1-byte header
@@ -167,10 +191,14 @@ class GoproWrite : public BLECharacteristicCallbacks {
         // Status 10 and 13 follow the camera, not this command (see loop()), so a start the
         // camera refuses (no SD card) does not show as recording.
         Serial.printf("  SHUTTER %s%s\n", m[2] ? "on (start recording)" : "off (stop)",
-                      dji::ready() ? "" : ", but the camera is not connected");
+                      dji::ready() && !dji::asleep() ? "" : ", camera asleep or not connected");
         dji::record(m[2]);
-      } else if (m[0] == 0x05) {
-        Serial.println("  SLEEP");
+      } else if (m[0] == 0x05) {  // the Sleep button on the GoPro's page in My Sensors
+        // It stays there while the camera sleeps (the ELEMNT can't tell), so it also wakes it.
+        bool awake = dji::ready() && !dji::asleep();
+        Serial.printf("  SLEEP%s\n", awake ? "" : ": the camera sleeps or is away, waking it");
+        if (awake) dji::sleep();
+        else dji::wake();
       } else if (m[0] == 0x3c) {  // Get Hardware Info: a HERO12 Black, matching the advertisement
         k += putInt(out + k, 62);                 // model number
         k += putStr(out + k, "HERO12 Black");     // model name
@@ -217,12 +245,27 @@ class BatteryRead : public BLECharacteristicCallbacks {
   }
 };
 
+// These also fire for the camera link, where we are the central (link_role 0).
 class Callbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *) override { Serial.println("ELEMNT connected"); }
-  void onDisconnect(BLEServer *) override {
-    Serial.println("disconnected, advertising again");
+  void onConnect(BLEServer *s, esp_ble_gatts_cb_param_t *p) override {
+    const esp_gatt_conn_params_t &c = p->connect.conn_params;
+    Serial.printf("%s link: interval %u.%02u ms, latency %u, timeout %u ms\n",
+                  p->connect.link_role == 1 ? "ELEMNT" : "camera", c.interval * 5 / 4,
+                  c.interval * 125 % 100, c.latency, c.timeout * 10);
+    if (p->connect.link_role != 1) {
+      // Not a client of ours. Without this, every notify() would go to the camera as well.
+      s->removePeerDevice(p->connect.conn_id, false);
+      return;
+    }
+    elemnt = true;
+    Serial.println("ELEMNT connected");
+  }
+  void onDisconnect(BLEServer *, esp_ble_gatts_cb_param_t *p) override {
+    if (p->disconnect.link_role != 1) return;
+    elemnt = false;
     statusPush = false;
-    BLEDevice::startAdvertising();
+    Serial.println("ELEMNT disconnected, advertising again");
+    if (!dji::waking()) BLEDevice::startAdvertising();  // else loop() does, after the wake-up
   }
 };
 
@@ -247,6 +290,7 @@ void setup() {
   const uint8_t base[] = {0x02, 0x60, 0x50, 0x00, 0x00, 0x40};
   esp_base_mac_addr_set(base);
   BLEDevice::setCustomGattsHandler(logGatt);
+  BLEDevice::setCustomGapHandler(logGap);
   BLEDevice::init(kName);
   Serial.printf("bluetooth address %s\n", BLEDevice::getAddress().toString().c_str());
 
@@ -299,7 +343,6 @@ void setup() {
   // schema 2; status bits (0x01 powered on, 0x04 pairing mode); camera ID 62 = HERO12 Black
   // (ELEMNT supports HERO9-13 and rejects 60, HERO11 Mini); capabilities; 0; 6-byte ID hash;
   // media offload status.
-  BLEAdvertisementData advData;
   advData.setFlags(ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
   advData.setPartialServices(BLEUUID((uint16_t)0xFEA6));
   const uint8_t manuf[] = {0xf2, 0x02, 0x02, 0x05, 62, 0x33, 0x00,
@@ -319,10 +362,15 @@ void setup() {
   dji::begin();  // the camera side: scans, connects and pairs from dji::loop()
 }
 
-// ponytail: these pushes run on this task while replies run on the Bluetooth task; a push and a
-// two-packet reply (the preset list) could interleave. Add a mutex around send() if that shows up.
 void loop() {
   dji::loop();
+
+  static bool wasWaking = false;
+  if (wasWaking && !dji::waking()) {  // the camera's wake-up advertisement is over: ours again
+    BLEDevice::getAdvertising()->setAdvertisementData(advData);
+    if (!elemnt) BLEDevice::startAdvertising();  // while connected, the ELEMNT needs none
+  }
+  wasWaking = dji::waking();
 
   static bool wasRecording = false;
   static uint16_t lastTime = 0;

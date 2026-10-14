@@ -190,8 +190,10 @@ bridge needs a large MTU to the camera. The ESP32 must be a BLE central (to the 
 peripheral (to the ELEMNT) at the same time.
 
 The camera side is `src/dji.cpp`. It is tested on its own with `src/dji_test.cpp` (step 1 of the plan
-in DJI_PROTOCOL.md) and merged into the bridge (step 2, tested). Next: step 3 (sleep, wake-up and
-reconnects).
+in DJI_PROTOCOL.md) and merged into the bridge (step 2, tested). Step 3 (sleep, wake-up and
+reconnects) is mostly tested. The ELEMNT's Sleep button (My Sensors → the GoPro) puts the camera to
+sleep and wakes it again, and its record button wakes the camera and then starts recording. That also
+works after a long press on the camera's power button. Pre-Rec is armed again after a wake-up.
 - A Karoo extension already exists: [derFrisson/Karoo-DJI-Osmo-extension](https://github.com/derFrisson/Karoo-DJI-Osmo-extension) (early stage). It is only relevant if switching head units.
 
 ## Gotchas
@@ -203,3 +205,17 @@ reconnects).
 - The serial monitor sometimes shows a run of `�` characters. The connection carries on, so it is line noise
   and not a reboot.
 - Do not copy Wahoo code into this repo. Summarize findings only.
+- Arduino's `BLEServer` callbacks also fire for the camera link, where the ESP32 is the central
+  (`link_role` 0). The server also adds that link to the peers that every `notify()` goes to.
+  `main.cpp` filters on `link_role` and removes the camera from the server's peers. Before that fix,
+  a camera disconnect cleared the ELEMNT's status registration.
+- `BLECharacteristic::notify()` silently drops a packet when the link is congested: only
+  `notify(): ... rc=-1` in the log. Since the camera link exists, this happens in the ELEMNT's burst
+  of requests after connecting, for example to both packets of the first preset list. The ELEMNT
+  asks again. **Don't retry the notifications:** with a retry, the ELEMNT stayed connected but went
+  silent after its burst (it never sent record or sleep again). Most likely the stack then dropped
+  one of its own read or write responses, and the ELEMNT waited for it. The bridge now slows the
+  camera link to 100–125 ms, to leave the ELEMNT link more radio time. The congestion still happens
+  briefly in the burst, but it clears within about 60 ms.
+- Timestamps shared between `loop()` and the Bluetooth task run on different cores. Don't make one
+  "never 0" with `millis() | 1`: that can be 1 ms in the future, and `millis() - t` then wraps around.

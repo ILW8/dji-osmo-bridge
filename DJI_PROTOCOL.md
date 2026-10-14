@@ -345,6 +345,30 @@ button (Q&A #10).
 - **Sleep** (long press on the power button, or command `0x001A` with power_mode 3) keeps the BLE
   link up. `1D02` then shows power_mode 3. Do not send commands while the camera sleeps.
   On wake-up the link drops briefly and the remote must reconnect (`docs/Q&A.md` #2).
+  - `001A`: payload 1 byte power_mode (0 normal, 3 sleep); the response is a 1-byte ret_code.
+    osmoControl notes the ack may not arrive before the camera sleeps.
+  - DJI: the camera may still send a few status frames while falling asleep, then nothing.
+  - Nothing wakes a sleeping camera over the existing link. vcijj_osmo-sync-shot found `001A`
+    power_mode 0 ignored while asleep. Key 0x03 SnapShot must follow the wake-up advertisement.
+    The DUML wake in osmosis and osmoControl is for an unconnected Osmo Nano and needs a separate
+    DUML pairing.
+  - **Tested (2026-10-14):**
+    - `001A` power_mode 3 is acked with ret_code 0 (`AA 13 00 20 … 00 1A 00 …`). The screen goes
+      dark and the link stays up.
+    - From that sleep, 3 s of the wake-up advertisement wakes the camera: the start-up chime and
+      animation play for 2–3 s. **The link stayed up** (no drop, unlike DJI's Q&A), and status pushes
+      came back on it. A `1D03` start sent on the first push recorded as soon as live view appeared.
+    - The wake-up drops Pre-Rec: the camera comes back unarmed. A QS press once it is back and
+      idle arms it again, and a `1D03` start after that keeps the buffer.
+    - A long press on the camera's power button while connected is the same sleep: `1D02` shows
+      power_mode 3 and the wake-up advertisement wakes it. (An earlier "it doesn't wake" was a bridge
+      bug that stopped the advertisement at once.)
+    - After `001A`, one more push with power_mode 0 arrives (before the ack), then power_mode 3.
+    - A wake-up 4 s after the sleep worked. No minimum delay seen so far.
+    - Link: the camera starts at 15 ms and asks for 20 ms itself; it accepts the bridge's
+      100–125 ms. The ELEMNT link runs at 40 ms. With the slow camera link, the ELEMNT's burst
+      after connecting still congests its link briefly (a few dropped notifications, each
+      congestion clears within about 60 ms), and record and sleep keep working.
 - **Auto power-off** turns the camera off completely and ends BLE. A powered-off camera cannot be
   woken over BLE. AeroCam keeps the camera awake with a QS key press every 10–300 s (default 15 s).
   AeroCam treats the link as dead after 8 s without status (45 s in keep-awake mode).
@@ -406,4 +430,20 @@ button (Q&A #10).
    - `1D02` battery → GoPro status 70 and `0x2A19`.
    - `1D02` recording state and record time → GoPro status 10 and 13. Armed pre-rec (`0x05`) counts
      as not recording.
-3. Handle sleep, wake-up and reconnects.
+3. **In progress (2026-10-14):** sleep, wake-up and reconnects.
+   - ELEMNT Sleep (GoPro command `05`, from the GoPro's page in My Sensors) → `001A` power_mode 3.
+     **Tested.** While the camera sleeps, the same button wakes it (tested).
+   - The bridge treats the camera as asleep when `1D02` shows power_mode 3 or no push has come for
+     3 s. A sleeping camera keeps the link up and goes quiet. While it sleeps, nothing is sent to it,
+     and the ELEMNT sees it as not recording.
+   - ELEMNT record while the camera sleeps or is not connected → the wake-up advertisement (in place
+     of the GoPro advertisement), then the start on the camera's first status push, if that comes
+     within 30 s. A stop cancels a pending start. The advertisement runs until the camera is back,
+     30 s at most. **Tested** from both kinds of sleep; the camera was back within 1–2 s.
+   - If Pre-Rec was armed when the camera fell asleep, the bridge arms it again with a QS press once
+     the camera is back and idle, before a pending start. **Tested**, with both wake-ups.
+   - Reconnects: after any drop the bridge scans again and redoes the connection request
+     (verify_mode 0) and the subscribe, as all the reference remotes do. **Tested:** camera off and
+     on reconnects with no prompt, and the ELEMNT still controls it.
+   - Not handled: the camera's Auto Power Off really powers it off, and it can't be woken from that
+     (AeroCam). AeroCam's keep-awake presses QS, which here toggles Pre-Rec, so it is not an option.

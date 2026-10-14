@@ -4,7 +4,7 @@
 
 namespace dji {
 
-Status status = {0, 0, 0xff, 0, 0};
+Status status = {0, 0, 0, 0xff, 0, 0};
 
 namespace {
 
@@ -20,6 +20,14 @@ BLEClient *client;
 BLERemoteCharacteristic *tx;  // 0xFFF5: frames to the camera
 uint16_t seq = 1;
 uint32_t pairStart;
+uint32_t lastPush;      // millis() of the last status push
+uint32_t pendingStart;  // millis() of a start waiting for the camera to wake up; 0 if none
+uint32_t wakeStart;     // millis() when the wake-up advertisement started; 0 if none
+uint32_t arming;        // millis() when QS was pressed to arm pre-rec again; 0 if not waiting
+bool preRec;            // pre-rec was armed the last time the camera was idle
+bool rearm;             // pre-rec was armed when the camera fell asleep: arm it again once back
+uint8_t camMac[6];      // the camera's address, for the wake-up advertisement
+bool known;             // camMac is set
 
 // DJI's CRCs: reflected, init 0x3AA3, no final XOR. poly 0xA001 = CRC16, 0xEDB88320 = CRC32.
 uint32_t crc(const uint8_t *p, size_t n, uint32_t poly) {
@@ -90,8 +98,46 @@ void onVerdict(const uint8_t *f, const uint8_t *p) {
   }
   const uint8_t sub[] = {3, 20, 0, 0, 0, 0};  // push_mode 3 (periodic + on change), 20 = 2 Hz
   send(0x00, 0x1d, 0x05, sub, sizeof sub, seq++);
+  status.powerMode = 0;  // it answered, so it is awake
+  lastPush = millis();
+  // A slow link from now on: 2 pushes a second need little, and the ELEMNT link shares the radio.
+  // Its notifications were dropped as congested (rc=-1) only once the camera was connected too.
+  esp_ble_conn_update_params_t cp = {};
+  memcpy(cp.bda, camMac, 6);
+  cp.min_int = 80;   // 100 ms
+  cp.max_int = 100;  // 125 ms
+  cp.timeout = 400;  // 4 s
+  esp_ble_gap_update_conn_params(&cp);
   state = kReady;
   Serial.println("camera: paired, status subscribed");
+}
+
+void pressQs() {  // short press of the QS button; set on the camera to Start/End Pre-Rec, it toggles
+  const uint8_t k[] = {0x02, 0x01, 0x00, 0x00};  // key_code QS, mode 1 (event), key_value 0 (short)
+  send(0x01, 0x00, 0x11, k, sizeof k, seq++);
+}
+
+// For each status push while the camera is awake: finish what waited for it to wake up. The wake-up
+// drops pre-rec, so arm it again first (from idle only, as QS toggles), then start a pending recording:
+// a start with pre-rec armed keeps the buffer.
+// ponytail: QS arms pre-rec only with the camera's QS button set to Start/End Pre-Rec. Pressed only
+// when pre-rec was armed before the sleep, so that setting is in use.
+void back() {
+  if (rearm && (status.state == 0x01 || status.state == 0x05)) {
+    rearm = false;
+    if (status.state == 0x01) {
+      Serial.println("camera: arming pre-rec again");
+      pressQs();
+      arming = millis();  // never 0: we're past boot
+    }
+  }
+  if (arming && (status.state == 0x05 || millis() - arming > 3000)) arming = 0;
+  if (pendingStart && !rearm && !arming) {
+    bool fresh = millis() - pendingStart < 30000;
+    pendingStart = 0;
+    Serial.println(fresh ? "camera: starting the recording" : "camera: back too late to record");
+    if (fresh) record(true);
+  }
 }
 
 void onNotify(BLERemoteCharacteristic *, uint8_t *f, size_t len, bool) {
@@ -115,8 +161,13 @@ void onNotify(BLERemoteCharacteristic *, uint8_t *f, size_t len, bool) {
     status.mode = p[0];
     status.state = p[1];
     status.recordTime = p[5] | p[6] << 8;
+    if (p[28] != status.powerMode) Serial.printf("camera: power mode %u\n", p[28]);
+    status.powerMode = p[28];
     status.battery = p[37];
     status.updates++;
+    lastPush = millis();
+    if (p[28] == 0 && (p[1] == 0x01 || p[1] == 0x05)) preRec = p[1] == 0x05;
+    if (state == kReady && !asleep()) back();
     return;
   }
   if (cmd == 0x0019 && !(f[3] & 0x20) && n >= 29 && p[26] == 2) onVerdict(f, p);
@@ -147,6 +198,8 @@ class Link : public BLEClientCallbacks {
 void connect() {
   Serial.printf("camera found at %s, connecting\n", camera->getAddress().toString().c_str());
   BLEDevice::getScan()->clearResults();
+  memcpy(camMac, *camera->getAddress().getNative(), 6);
+  known = true;
   state = kPairing;
   if (!client->connect(camera)) {
     Serial.println("camera: connect failed");
@@ -201,9 +254,24 @@ void begin() {
   scan->setActiveScan(true);
 }
 
-// ponytail: a dead link is noticed only via the BLE supervision timeout; add a "no 1D02 for 8 s"
-// check if the camera turns out to stay connected but silent. Sleep and wake-up are not handled.
 void loop() {
+  if (wakeStart && ((ready() && !asleep()) || millis() - wakeStart > 30000)) {
+    BLEDevice::getAdvertising()->stop();
+    wakeStart = 0;
+    Serial.println(ready() && !asleep() ? "camera: woken up" : "camera: did not wake up in 30 s");
+  }
+  static bool wasAsleep = false;
+  if (ready() && asleep() != wasAsleep) {
+    wasAsleep = !wasAsleep;
+    if (wasAsleep) {
+      rearm = preRec;
+      Serial.printf("camera: asleep (power mode %u, last status %lu ms ago%s)\n", status.powerMode,
+                    millis() - lastPush, rearm ? ", pre-rec was armed" : "");
+    } else {
+      Serial.println("camera: awake");
+    }
+  }
+
   if (state == kIdle) {
     Serial.println("camera: scanning");
     state = kScanning;
@@ -219,21 +287,67 @@ void loop() {
 
 bool ready() { return state == kReady; }
 
+// A sleeping camera keeps the link up and goes quiet; the last pushes before that may show power
+// mode 3. The link drops when it wakes up. A lost link is noticed by the BLE supervision timeout.
+// ponytail: a camera that hangs but stays connected also reads as asleep, and a wake-up advertisement
+// won't help it. Disconnect after a longer silence if that ever shows up.
+bool asleep() { return ready() && (status.powerMode == 3 || millis() - lastPush > 3000); }
+
 // Status 0x03 with the record time running. Not 0x05: that is the armed pre-rec buffer, where the
 // record time counts buffered seconds. The camera also shows 0x03 with time 0 for one push when it
 // starts pre-rec and when a recording stops, so time 0 doesn't count (a real start shows it ~1 s late).
 // ponytail: 0x03 also means "taking a photo", so photo mode (0x05) is excluded; other photo-type
 // modes would read as recording if their record time runs.
 bool recording() {
-  return ready() && status.state == 0x03 && status.recordTime > 0 && status.mode != 0x05;
+  return ready() && !asleep() && status.state == 0x03 && status.recordTime > 0 &&
+         status.mode != 0x05;
 }
 
 void record(bool start) {
-  if (!ready()) return;
-  // device_id as DJI's demo sends it (the camera seems not to check it), record_ctrl, reserved.
-  const uint8_t p[9] = {0x00, 0x00, 0xff, 0x33, (uint8_t)!start};
-  send(0x01, 0x1d, 0x03, p, sizeof p, seq++);
+  pendingStart = 0;
+  if (ready() && !asleep()) {
+    // device_id as DJI's demo sends it (the camera seems not to check it), record_ctrl, reserved.
+    const uint8_t p[9] = {0x00, 0x00, 0xff, 0x33, (uint8_t)!start};
+    send(0x01, 0x1d, 0x03, p, sizeof p, seq++);
+  } else if (start) {  // started from onNotify once the camera is back
+    pendingStart = millis();
+    wake();
+  }
 }
+
+void sleep() {
+  if (!ready() || asleep()) return;
+  const uint8_t p[] = {3};  // power_mode 3 = sleep
+  send(0x01, 0x00, 0x1a, p, sizeof p, seq++);
+  status.powerMode = 3;  // send nothing more: DJI says a sleeping camera can't take data
+}
+
+// DJI's wake-up advertisement, in place of the caller's until the camera is back (30 s at most;
+// one 3 s round, as other remotes use, woke it from our sleep command but not from the power
+// button): manufacturer data "WKP" + the camera's address in reverse, and no flags. The camera
+// wants connectable ADV_IND; BLEAdvertising's other defaults fit too (20-40 ms, and our public
+// address, which the camera knows). DJI says the camera then drops the link; ours kept it.
+void wake() {
+  if ((ready() && !asleep()) || wakeStart) return;
+  if (!known) {
+    Serial.println("camera: not seen since boot, so it can't be woken");
+    return;
+  }
+  uint8_t a[11] = {10, 0xff, 'W', 'K', 'P'};
+  for (int i = 0; i < 6; i++) a[5 + i] = camMac[5 - i];
+  BLEAdvertisementData d;
+  d.addData(std::string((const char *)a, sizeof a));
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->stop();
+  adv->setAdvertisementData(d);
+  adv->start();
+  // Not millis() | 1 to make sure it isn't 0: that is up to 1 ms ahead, and loop(), on the other
+  // core, then saw millis() - wakeStart wrap around to "over 30 s" and stopped the advertisement.
+  wakeStart = millis();  // never 0: we're past boot
+  dump("wake-up advertisement", a, sizeof a);
+}
+
+bool waking() { return wakeStart != 0; }
 
 void sendRaw(uint8_t type, uint8_t set, uint8_t id, const uint8_t *p, size_t n) {
   if (ready() && n <= 46) send(type, set, id, p, n, seq++);  // 46 = room in send()'s frame buffer
