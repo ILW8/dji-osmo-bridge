@@ -26,7 +26,10 @@ BLE2902 *batteryCccd;
 
 // Debug: log every GATT read/write the ELEMNT makes, by attribute handle.
 // Match handles against the map printed at boot.
-void logGatt(esp_gatts_cb_event_t event, esp_gatt_if_t, esp_ble_gatts_cb_param_t *p) {
+esp_gatt_if_t serverIf;  // our GATT server's interface, for Callbacks::onConnect()
+
+void logGatt(esp_gatts_cb_event_t event, esp_gatt_if_t gattsIf, esp_ble_gatts_cb_param_t *p) {
+  if (event == ESP_GATTS_REG_EVT) serverIf = gattsIf;  // BLEServer keeps its own private
   if (event == ESP_GATTS_READ_EVT) {
     Serial.printf("GATT read  handle %u\n", p->read.handle);
   } else if (event == ESP_GATTS_WRITE_EVT) {
@@ -38,6 +41,9 @@ void logGatt(esp_gatts_cb_event_t event, esp_gatt_if_t, esp_ble_gatts_cb_param_t
   } else if (event == ESP_GATTS_CONGEST_EVT) {
     Serial.printf("GATT conn %u %s\n", p->congest.conn_id,
                   p->congest.congested ? "congested" : "no longer congested");
+  } else if (event == ESP_GATTS_OPEN_EVT) {  // see Callbacks::onConnect()
+    Serial.printf("GATT ELEMNT link claimed: status 0x%02x (0x91 = already open, as wanted)\n",
+                  p->open.status);
   } else if (event == ESP_GATTS_RESPONSE_EVT && p->rsp.status != ESP_GATT_OK) {
     Serial.printf("GATT response for handle %u FAILED (0x%02x)\n", p->rsp.handle, p->rsp.status);
   }
@@ -263,8 +269,9 @@ class BatteryRead : public BLECharacteristicCallbacks {
 class Callbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *s, esp_ble_gatts_cb_param_t *p) override {
     const esp_gatt_conn_params_t &c = p->connect.conn_params;
-    Serial.printf("%s link: interval %u.%02u ms, latency %u, timeout %u ms\n",
-                  p->connect.link_role == 1 ? "ELEMNT" : "camera", c.interval * 5 / 4,
+    Serial.printf("%s link %s: interval %u.%02u ms, latency %u, timeout %u ms\n",
+                  p->connect.link_role == 1 ? "ELEMNT" : "camera",
+                  BLEAddress(p->connect.remote_bda).toString().c_str(), c.interval * 5 / 4,
                   c.interval * 125 % 100, c.latency, c.timeout * 10);
     if (p->connect.link_role != 1) {
       // Not a client of ours. Without this, every notify() would go to the camera as well.
@@ -273,6 +280,11 @@ class Callbacks : public BLEServerCallbacks {
     }
     elemnt = true;
     Serial.println("ELEMNT connected");
+    // Claim the link for our server. When an app unregisters, Bluedroid (GATT_Deregister) closes
+    // every link that no app has claimed, and BLEClient unregisters on each camera disconnect.
+    // A link the ELEMNT opened is claimed by none, so it dropped 3-7 ms after the camera's
+    // (reason 0x16). The answer is ESP_GATTS_OPEN_EVT, logged in logGatt().
+    esp_ble_gatts_open(serverIf, p->connect.remote_bda, true);
   }
   void onDisconnect(BLEServer *, esp_ble_gatts_cb_param_t *p) override {
     // reason: 0x08 supervision timeout, 0x13 the other side closed it, 0x16 we did, 0x22 no answer
