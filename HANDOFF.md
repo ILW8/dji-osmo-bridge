@@ -95,21 +95,13 @@ The earlier radar route (name `TRACKR RADAR`, battery only) works too and is kep
 
 ### GoPro page display quirks (ELEMNT side, seen on the ROAM 3)
 
-- **Delayed battery readout:** the GoPro page battery does not follow changes. It stayed at 42% after the
-  bridge reported 30%, even after switching pages or starting a recording. The value does reach the ELEMNT:
-  the sensor ring updates at once, and a full reload shows it.
-  **Workaround:** side button → My Sensors → select the GoPro (the gauge animates) → dismiss → back to
-  the GoPro page. It now shows the new value. Opening My Sensors without selecting the GoPro is not enough.
-- **Recording indicator lags (before the merge only):** after pressing record or stop, the red
-  indicator did not change until you switched pages and came back. Back then the bridge sent status 10
-  straight after the command reply. In the merged build it is sent about a second later, once the
-  camera reports the change, and the indicator follows at once.
+- **Page didn't redraw (before the merge only):** the GoPro page's battery did not follow changes
+  (it stayed at 42% after the bridge reported 30%), and after record or stop the red indicator did not
+  change until you switched pages and came back. The values did reach the ELEMNT: the sensor ring
+  updated at once. In the merged build the page redraws correctly, both the battery and the indicator.
+  Which change fixed it is unknown. One difference: the merged build sends status 10 about a second
+  after the command reply, once the camera reports the change, not straight after it.
 - The Preset field shows "Standard" with grayed-out arrows, because only one preset is reported.
-- Our status updates are decoded: a status 10 update makes the ELEMNT poll statuses at once. In the
-  legacy build's native code, a value change sets a redraw flag and fires a "config changed" event
-  (`notify_event(29, 0)`). The GoPro page listens for that event. Why the ROAM 3 does not redraw is
-  unknown. The GoPro details here come from **build 18001**, the legacy build, and the native GoPro code
-  of 302826 was not read. A real GoPro probably shows the same lag.
 
 ## How the ELEMNT firmware handles BLE sensor battery
 
@@ -174,8 +166,6 @@ assigned over ANT+: no BLE service maps to them, and `0xCC01` Magene is not in t
 
 ## Open questions
 
-- Why the GoPro page does not redraw on status changes (see "GoPro page display quirks").
-  Reading the native GoPro code of build 302826 may answer it.
 - Whether the GoPro activity records anything in the FIT file (camera events). Not checked on a ride.
 - Whether the GoPro route works with an arbitrary name, for example "Osmo Action 5 Pro".
   The legacy native library has a `GoPro (#*)` string.
