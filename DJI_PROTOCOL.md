@@ -400,8 +400,10 @@ button (Q&A #10).
 1. **Done (2026-10-14):** test sketch, camera side only (`src/dji_test.cpp`, `pio run -e dji-test`).
    Connect as a central with MTU 500, pair with Accept, subscribe to `1D02`, and log battery, mode
    and recording state. Start and stop recording from serial commands.
-2. Merge with the GoPro side:
+2. **Done (2026-10-14), tested with the ROAM 3 and the camera:** merged with the GoPro side
+   (`src/main.cpp`, `pio run -e esp32dev`):
    - ELEMNT `SHUTTER on/off` → `1D03` start/stop.
    - `1D02` battery → GoPro status 70 and `0x2A19`.
-   - `1D02` recording state → GoPro status 10.
+   - `1D02` recording state and record time → GoPro status 10 and 13. Armed pre-rec (`0x05`) counts
+     as not recording.
 3. Handle sleep, wake-up and reconnects.

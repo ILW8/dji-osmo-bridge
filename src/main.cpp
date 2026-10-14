@@ -1,19 +1,20 @@
-// Step 2: shows up on the ELEMNT as a GoPro (Open GoPro BLE service 0xFEA6) and logs what the
-// ELEMNT asks for. Every command, setting and query gets a "success" reply with plausible values.
-// Type 0-100 + Enter in the Serial Monitor (115200 baud) to change the battery level.
+// The bridge: shows up on the ELEMNT as a GoPro (Open GoPro BLE service 0xFEA6) and connects to the
+// Osmo Action 5 Pro (dji.cpp). The ELEMNT's record button starts and stops the camera, and the
+// ELEMNT shows the camera's battery and recording state. Every other command, setting and query
+// gets a "success" reply with plausible values. Log at 115200 baud.
 // See HANDOFF.md for why a GoPro, and for the radar fallback (commit 7ff56a4).
 #include <Arduino.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLESecurity.h>
 #include <BLE2902.h>
+#include "dji.h"
 
 // Name and advertisement copy a real GoPro (Open GoPro test vectors). The ELEMNT lists a GoPro only
 // while it advertises "in pairing mode", like a camera put into pairing mode by hand.
 const char *kName = "GoPro 0042";  // "GoPro" + last 4 digits of the serial, as cameras do
+// ponytail: shown until the camera's first status push; hide the GoPro until then if it misleads.
 uint8_t level = 42;
-bool recording = false;
-uint32_t recStart = 0;  // millis() when recording started
 bool statusPush = false;  // the ELEMNT registered for status updates (query 0x53)
 BLECharacteristic *battery, *cmd, *cmdRsp, *set, *setRsp, *qry, *qryRsp;
 BLE2902 *batteryCccd;
@@ -76,17 +77,17 @@ uint32_t statusValue(uint8_t id, uint8_t &len) {
   switch (id) {
     case 1: return 1;                                                  // internal battery present
     case 2: return level > 66 ? 3 : level > 33 ? 2 : level > 10 ? 1 : 0;  // battery bars
-    case 10: return recording;                                         // encoding active
+    case 10: return dji::recording();                                  // encoding active
     case 33: return 0;                                                 // SD card OK
     case 70: return level;                                             // internal battery %
   }
   len = 4;
   switch (id) {
-    case 13: return recording ? (millis() - recStart) / 1000 : 0;  // recording duration, s
-    case 34: return 999;                                           // photos remaining
-    case 35: return 7200;                                          // video remaining, s
-    case 96: return 1000;                                          // active preset group: video
-    case 97: return 1;                                             // active preset: see kPresets
+    case 13: return dji::recording() ? dji::status.recordTime : 0;  // recording duration, s
+    case 34: return 999;                                            // photos remaining
+    case 35: return 7200;                                           // video remaining, s
+    case 96: return 1000;                                           // active preset group: video
+    case 97: return 1;                                              // active preset: see kPresets
   }
   len = 1;
   return 0;  // ponytail: everything else reads as 0 until the ELEMNT shows it needs more
@@ -163,9 +164,11 @@ class GoproWrite : public BLECharacteristicCallbacks {
       out[k++] = m[0];
       out[k++] = 0x00;
       if (m[0] == 0x01 && n >= 3) {
-        recStart = millis();
-        recording = m[2];
-        Serial.printf("  SHUTTER %s\n", recording ? "on (start recording)" : "off (stop)");
+        // Status 10 and 13 follow the camera, not this command (see loop()), so a start the
+        // camera refuses (no SD card) does not show as recording.
+        Serial.printf("  SHUTTER %s%s\n", m[2] ? "on (start recording)" : "off (stop)",
+                      dji::ready() ? "" : ", but the camera is not connected");
+        dji::record(m[2]);
       } else if (m[0] == 0x05) {
         Serial.println("  SLEEP");
       } else if (m[0] == 0x3c) {  // Get Hardware Info: a HERO12 Black, matching the advertisement
@@ -195,10 +198,6 @@ class GoproWrite : public BLECharacteristicCallbacks {
       if (q == 0x73) statusPush = false;
     }
     send(c == cmd ? cmdRsp : c == set ? setRsp : qryRsp, out, k);
-    if (c == cmd && m[0] == 0x01) {  // shutter: recording state and duration changed
-      pushStatus(10);
-      pushStatus(13);
-    }
   }
 };
 
@@ -316,21 +315,38 @@ void setup() {
   adv->setScanResponseData(scanData);
   BLEDevice::startAdvertising();
   Serial.printf("advertising as '%s'\n", kName);
+
+  dji::begin();  // the camera side: scans, connects and pairs from dji::loop()
 }
 
+// ponytail: these pushes run on this task while replies run on the Bluetooth task; a push and a
+// two-packet reply (the preset list) could interleave. Add a mutex around send() if that shows up.
 void loop() {
-  if (!Serial.available()) return;
-  String s = Serial.readStringUntil('\n');
-  s.trim();
-  if (s.length() == 0 || !isDigit(s[0])) return;
-  int v = s.toInt();
-  if (v > 100) return;
-  level = v;
-  battery->setValue(&level, 1);
-  // The ELEMNT never subscribes to 0x2A19 but accepts a notification anyway.
-  // Faking our side of the subscription lets notify() send.
-  batteryCccd->setNotifications(true);
-  battery->notify();
-  pushStatus(70);
-  Serial.printf("battery now %d%% (notified)\n", level);
+  dji::loop();
+
+  static bool wasRecording = false;
+  static uint16_t lastTime = 0;
+  bool rec = dji::recording();
+  uint16_t t = dji::status.recordTime;
+  if (rec != wasRecording) {
+    Serial.printf("camera %s recording\n", rec ? "started" : "stopped");
+    pushStatus(10);
+  }
+  // The ELEMNT never polls status 13; its timer moves only with these pushes. A GoPro sends a
+  // registered status whenever it changes, so this one once a second while recording.
+  if (rec != wasRecording || (rec && t != lastTime)) pushStatus(13);
+  wasRecording = rec;
+  lastTime = t;
+
+  uint8_t b = dji::status.battery;  // 0xff until the camera's first status push
+  if (b <= 100 && b != level) {
+    level = b;
+    battery->setValue(&level, 1);
+    // The ELEMNT never subscribes to 0x2A19 but accepts a notification anyway.
+    // Faking our side of the subscription lets notify() send.
+    batteryCccd->setNotifications(true);
+    battery->notify();
+    pushStatus(70);
+    Serial.printf("camera battery %u%% (notified)\n", level);
+  }
 }

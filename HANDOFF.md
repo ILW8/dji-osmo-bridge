@@ -1,10 +1,10 @@
 # Handoff: DJI Osmo battery on Wahoo ELEMNT ROAM 3
 
-Status as of 2026-10-14. **The ELEMNT side works, now as an emulated GoPro.** The ROAM 3 pairs with the
-bridge as a GoPro. The battery shows on My Sensors and as the ring around the sensor icon, and the
-GoPro page shows battery, mode and preset. The record and stop buttons reach the bridge. Next is the
-camera side: the bridge will pass those commands on to the Osmo and report the Osmo's battery and
-recording state back.
+Status as of 2026-10-14. **The bridge works end to end** (tested with the ROAM 3 and the camera). The
+ROAM 3 pairs with the bridge as a GoPro. The battery shows on My Sensors and as the ring around the
+sensor icon, and the GoPro page shows battery, mode and preset. The bridge passes the record and stop
+buttons on to the Osmo and reports the Osmo's battery, recording state and record time back. The
+record button works with pre-rec armed: the recording keeps the buffered seconds.
 The earlier radar route (name `TRACKR RADAR`, battery only) works too and is kept in commit `7ff56a4`.
 
 ## Goal and constraints
@@ -27,7 +27,8 @@ The earlier radar route (name `TRACKR RADAR`, battery only) works too and is kep
   `JAVA_HOME="C:/Program Files/Java/jdk-21"` for the command (the system `JAVA_HOME` is JDK 17).
   REA's Ghidra provider only accepts PE files on Windows, so run `support/analyzeHeadless.bat` directly.
   `cmd.exe` mangles `|` in arguments, so pass several regexes as separate arguments instead of one with `|`.
-- Serial monitor at 115200. Type `0`–`100` + Enter to set the reported battery.
+- Serial monitor at 115200. The bridge only logs. The camera test sketch (`pio run -e dji-test`) takes
+  commands, see `src/dji_test.cpp`.
 - Flash use is about 86% (the Bluedroid library is large). If space runs out, add `board_build.partitions = huge_app.csv`.
 - CLion's clang errors such as `'Arduino.h' file not found` are an indexing problem only. The PlatformIO build is fine.
 - Git: `user.email` is set locally to `ilw8@41f.dev`.
@@ -58,13 +59,18 @@ The earlier radar route (name `TRACKR RADAR`, battery only) works too and is kep
     96 (preset group 1000 = video), 97 (active preset 1). The length per status follows the Open GoPro spec.
   - Protobuf `f5 72` (GetPresetStatus): one video group holding one "Standard" preset.
     Other protobuf commands get ResponseGeneric SUCCESS.
-  - Command `01` (shutter) logs `SHUTTER on/off`. The bridge then sends status 10 and 13 to the ELEMNT
-    (as `0x93`), but only if the ELEMNT registered for them with query `0x53`.
+  - Command `01` (shutter) logs `SHUTTER on/off` and sends `1D03` start or stop to the camera.
+    Statuses 10 and 13 follow the camera's status push, not the command, so a refused start (no SD
+    card) does not show as recording, and armed pre-rec shows as not recording. When the camera starts
+    or stops, the bridge sends status 10 and 13 to the ELEMNT (as `0x93`), but only if the ELEMNT
+    registered for them with query `0x53`. While recording it also sends 13 each time the camera's
+    record time changes: the ELEMNT never polls 13, so its timer stood at 00:01 without these.
 - **Framing:** messages are split into 20-byte notifications, because the ELEMNT never negotiates a
   larger MTU. A message that needs more than one packet **must** use the 13-bit header (`0x20 | len>>8`).
   The ELEMNT reassembles packets only when the first byte has `0x20` or `0x80` set. A split message with the
   5-bit header was parsed as its first packet alone, which is why the 21-byte preset list was lost at first.
-- **Serial:** `0`–`100` + Enter sets the battery. The bridge notifies `0x2A19` and sends status 70.
+- **Battery:** the camera's, from its status push. When it changes, the bridge notifies `0x2A19` and
+  sends status 70. It reads 42% until the camera's first push.
 - Logs every GATT read and write by handle, every reply, and the bonding result.
 
 ### Observed ELEMNT ↔ GoPro session
@@ -90,8 +96,10 @@ The earlier radar route (name `TRACKR RADAR`, battery only) works too and is kep
   the sensor ring updates at once, and a full reload shows it.
   **Workaround:** side button → My Sensors → select the GoPro (the gauge animates) → dismiss → back to
   the GoPro page. It now shows the new value. Opening My Sensors without selecting the GoPro is not enough.
-- **Recording indicator lags:** after pressing record or stop, the red indicator does not change until
-  you switch pages and come back.
+- **Recording indicator lags (before the merge only):** after pressing record or stop, the red
+  indicator did not change until you switched pages and came back. Back then the bridge sent status 10
+  straight after the command reply. In the merged build it is sent about a second later, once the
+  camera reports the change, and the indicator follows at once.
 - The Preset field shows "Standard" with grayed-out arrows, because only one preset is reported.
 - Our status updates are decoded: a status 10 update makes the ELEMNT poll statuses at once. In the
   legacy build's native code, a value change sets a redraw flag and fires a "config changed" event
@@ -169,7 +177,7 @@ assigned over ANT+: no BLE service maps to them, and `0xCC01` Magene is not in t
   The legacy native library has a `GoPro (#*)` string.
 - Radar route only: what the ELEMNT does long-term with a "radar" that has no radar service.
 
-## Camera side (researched, not built)
+## Camera side
 
 The full protocol is in **[DJI_PROTOCOL.md](DJI_PROTOCOL.md)**: frame format and CRCs, transport rules,
 pairing, the `1D02` status push, `1D03` record, sleep and wake-up, references, unverified points, and the
@@ -181,8 +189,9 @@ the protocol: the user taps Accept on the camera once. Each frame must fit in on
 bridge needs a large MTU to the camera. The ESP32 must be a BLE central (to the camera) and a
 peripheral (to the ELEMNT) at the same time.
 
-Next step: an Osmo-only test sketch as a second PlatformIO environment (step 1 of the plan in
-DJI_PROTOCOL.md). Merge it with the GoPro bridge after that.
+The camera side is `src/dji.cpp`. It is tested on its own with `src/dji_test.cpp` (step 1 of the plan
+in DJI_PROTOCOL.md) and merged into the bridge (step 2, tested). Next: step 3 (sleep, wake-up and
+reconnects).
 - A Karoo extension already exists: [derFrisson/Karoo-DJI-Osmo-extension](https://github.com/derFrisson/Karoo-DJI-Osmo-extension) (early stage). It is only relevant if switching head units.
 
 ## Gotchas
