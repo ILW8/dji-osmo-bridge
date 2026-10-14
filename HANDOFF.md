@@ -65,12 +65,14 @@ The earlier radar route (name `TRACKR RADAR`, battery only) works too and is kep
     or stops, the bridge sends status 10 and 13 to the ELEMNT (as `0x93`), but only if the ELEMNT
     registered for them with query `0x53`. While recording it also sends 13 each time the camera's
     record time changes: the ELEMNT never polls 13, so its timer stood at 00:01 without these.
+    A stop is passed on only once it has held for 500 ms: after one stop, the camera's bunched
+    pushes read stopped, recording, stopped within 120 ms, and the red indicator flickered.
 - **Framing:** messages are split into 20-byte notifications, because the ELEMNT never negotiates a
   larger MTU. A message that needs more than one packet **must** use the 13-bit header (`0x20 | len>>8`).
   The ELEMNT reassembles packets only when the first byte has `0x20` or `0x80` set. A split message with the
   5-bit header was parsed as its first packet alone, which is why the 21-byte preset list was lost at first.
 - **Battery:** the camera's, from its status push. When it changes, the bridge notifies `0x2A19` and
-  sends status 70. It reads 42% until the camera's first push.
+  sends status 70. It reads 10% until the camera's first push.
 - Logs every GATT read and write by handle, every reply, and the bonding result.
 
 ### Observed ELEMNT ↔ GoPro session
@@ -194,6 +196,8 @@ in DJI_PROTOCOL.md) and merged into the bridge (step 2, tested). Step 3 (sleep, 
 reconnects) is mostly tested. The ELEMNT's Sleep button (My Sensors → the GoPro) puts the camera to
 sleep and wakes it again, and its record button wakes the camera and then starts recording. That also
 works after a long press on the camera's power button. Pre-Rec is armed again after a wake-up.
+The camera's address is kept in NVS, so the ELEMNT can still wake the camera after a bridge reboot
+(tested). But then the ELEMNT dropped and could not reconnect: see the BLEClient gotcha below.
 - A Karoo extension already exists: [derFrisson/Karoo-DJI-Osmo-extension](https://github.com/derFrisson/Karoo-DJI-Osmo-extension) (early stage). It is only relevant if switching head units.
 
 ## Gotchas
@@ -217,5 +221,13 @@ works after a long press on the camera's power button. Pre-Rec is armed again af
   one of its own read or write responses, and the ELEMNT waited for it. The bridge now slows the
   camera link to 100–125 ms, to leave the ELEMNT link more radio time. The congestion still happens
   briefly in the burst, but it clears within about 60 ms.
+- `BLEClient::getService()` and the other BLEClient calls wait with no timeout, and only a
+  disconnect ends the wait. A sleeping camera takes the connection and answers nothing, so `loop()`
+  hung for 49 s. The wake-up advertisement then never ended, and the ELEMNT dropped (cause not
+  known; the log now shows each link's disconnect reason). After that, the bridge reconnected to the
+  camera 4 times a second, and each link dropped as it came up, while the ELEMNT could not get back
+  in. `dji.cpp` now disconnects after 5 s with an `esp_timer` and holds off the next attempt.
+  Another sleeping camera did answer discovery, but not the R SDK connection request. `dji.cpp`
+  then disconnects after 8 s without any valid frame.
 - Timestamps shared between `loop()` and the Bluetooth task run on different cores. Don't make one
   "never 0" with `millis() | 1`: that can be 1 ms in the future, and `millis() - t` then wraps around.

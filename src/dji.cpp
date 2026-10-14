@@ -1,6 +1,7 @@
 #include "dji.h"
 #include <Arduino.h>
 #include <BLEDevice.h>
+#include <Preferences.h>
 
 namespace dji {
 
@@ -26,8 +27,12 @@ uint32_t wakeStart;     // millis() when the wake-up advertisement started; 0 if
 uint32_t arming;        // millis() when QS was pressed to arm pre-rec again; 0 if not waiting
 bool preRec;            // pre-rec was armed the last time the camera was idle
 bool rearm;             // pre-rec was armed when the camera fell asleep: arm it again once back
-uint8_t camMac[6];      // the camera's address, for the wake-up advertisement
+uint8_t camMac[6];      // the camera's address, for the wake-up advertisement; kept in NVS
 bool known;             // camMac is set
+uint32_t lastTry;       // millis() of the last connection attempt; 0 once one gets as far as pairing
+volatile bool sleepy;   // that attempt got a link but no answers: the camera sleeps
+bool answered;          // a valid frame came on this link: the camera is awake
+esp_timer_handle_t watchdog;
 
 // DJI's CRCs: reflected, init 0x3AA3, no final XOR. poly 0xA001 = CRC16, 0xEDB88320 = CRC32.
 uint32_t crc(const uint8_t *p, size_t n, uint32_t poly) {
@@ -98,6 +103,7 @@ void onVerdict(const uint8_t *f, const uint8_t *p) {
   }
   const uint8_t sub[] = {3, 20, 0, 0, 0, 0};  // push_mode 3 (periodic + on change), 20 = 2 Hz
   send(0x00, 0x1d, 0x05, sub, sizeof sub, seq++);
+  lastTry = 0;
   status.powerMode = 0;  // it answered, so it is awake
   lastPush = millis();
   // A slow link from now on: 2 pushes a second need little, and the ELEMNT link shares the radio.
@@ -154,6 +160,7 @@ void onNotify(BLERemoteCharacteristic *, uint8_t *f, size_t len, bool) {
     if (!repeat) dump("bad frame", f, len);  // truncated by a small MTU, most likely
     return;
   }
+  answered = true;
   const uint8_t *p = f + 14;
   size_t n = len - 18;
   uint16_t cmd = f[12] << 8 | f[13];
@@ -195,22 +202,43 @@ class Link : public BLEClientCallbacks {
   }
 };
 
+// A sleeping camera keeps advertising and takes the connection, but answers nothing. BLEClient
+// then waits for its services forever: loop() hung for 49 s, and with it the end of the wake-up
+// advertisement. The camera woke up meanwhile, but the stuck link never recovered. Disconnecting
+// ends the wait; loop() holds off the next attempt.
+void stalled(void *) {
+  sleepy = true;
+  Serial.println("camera: connected, but it answers nothing (asleep?), disconnecting");
+  client->disconnect();
+}
+
 void connect() {
   Serial.printf("camera found at %s, connecting\n", camera->getAddress().toString().c_str());
   BLEDevice::getScan()->clearResults();
-  memcpy(camMac, *camera->getAddress().getNative(), 6);
-  known = true;
+  const uint8_t *mac = *camera->getAddress().getNative();
+  if (!known || memcmp(camMac, mac, 6)) {  // a new camera: remember it, to wake it after a reboot
+    memcpy(camMac, mac, 6);
+    known = true;
+    Preferences nv;
+    nv.begin("dji");
+    nv.putBytes("mac", camMac, 6);
+    nv.end();
+  }
   state = kPairing;
+  lastTry = pairStart = millis();
+  sleepy = answered = false;
   if (!client->connect(camera)) {
     Serial.println("camera: connect failed");
     state = kIdle;
     return;
   }
+  esp_timer_start_once(watchdog, 5000000);  // 5 s for the camera to answer, see stalled()
   BLERemoteService *svc = client->getService(BLEUUID((uint16_t)0xfff0));
   BLERemoteCharacteristic *rx = svc ? svc->getCharacteristic(BLEUUID((uint16_t)0xfff4)) : nullptr;
   tx = svc ? svc->getCharacteristic(BLEUUID((uint16_t)0xfff5)) : nullptr;
   if (!rx || !tx) {
-    Serial.println("camera: no 0xFFF0 service");
+    esp_timer_stop(watchdog);
+    if (!sleepy) Serial.println("camera: no 0xFFF0 service");
     client->disconnect();
     return;
   }
@@ -218,6 +246,7 @@ void connect() {
   // doesn't know its connection ID yet and skips the request (the log showed MTU 23). Ask again.
   client->setMTU(500);
   rx->registerForNotify(onNotify);
+  esp_timer_stop(watchdog);
   delay(2000);  // DJI's demo waits this long after enabling notifications
   Serial.printf("camera: MTU %u\n", client->getMTU());  // below 54 the request below is split
 
@@ -230,7 +259,6 @@ void connect() {
   uint16_t code = random(10000);
   p[27] = code;
   p[28] = code >> 8;
-  pairStart = millis();
   send(0x02, 0x00, 0x19, p, sizeof p, seq++);
   Serial.println("camera: tap Accept on the camera if it asks");
 }
@@ -245,6 +273,16 @@ void begin() {
   uint8_t f[sizeof want];
   build(f, 0x00, 0x1d, 0x05, sub, sizeof sub, 2);
   if (memcmp(f, want, sizeof want)) Serial.println("dji: frame self-test FAILED");
+
+  Preferences nv;  // the camera from an earlier boot: one that sleeps since then can still be woken
+  nv.begin("dji", true);
+  known = nv.getBytes("mac", camMac, 6) == 6;
+  nv.end();
+  if (known) Serial.printf("camera: last seen at %s\n", BLEAddress(camMac).toString().c_str());
+
+  esp_timer_create_args_t t = {};
+  t.callback = stalled;
+  esp_timer_create(&t, &watchdog);
 
   BLEDevice::setMTU(500);  // the camera needs one whole frame per write and per notification
   client = BLEDevice::createClient();
@@ -272,14 +310,25 @@ void loop() {
     }
   }
 
-  if (state == kIdle) {
+  // After a failed attempt, wait before the next: 2 s (it spun at 4 Hz once, each link dropped as
+  // it came up), or 30 s if the camera sleeps, as each try holds a dead link for 5-8 s. While it is
+  // being woken: from 1.5 s into the wake-up (it was back within 1-2 s), and soon after each try.
+  // ponytail: a camera switched on by hand during the 30 s is found when they're over.
+  uint32_t w = wakeStart, t = lastTry, now = millis();  // now last: never before w (other core)
+  bool hold = w ? now - w < 1500 || (t && now - t < 1500)
+                : t && now - t < (sleepy ? 30000 : 2000);
+  if (state == kIdle && !hold) {
     Serial.println("camera: scanning");
     state = kScanning;
     BLEDevice::getScan()->start(0, nullptr, false);  // until Found stops it
   } else if (state == kFound) {
     connect();
-  } else if (state == kPairing && millis() - pairStart > 30000) {
-    Serial.println("camera: no pairing answer in 30 s, reconnecting");
+  } else if (state == kPairing && millis() - pairStart > (answered ? 30000 : 8000)) {
+    // An awake camera answers the connection request (sent ~3 s in) within 0.1 s, also before the
+    // user taps Accept. A sleeping one may answer everything else on the link, but not that.
+    sleepy = !answered;
+    Serial.println(answered ? "camera: no pairing answer in 30 s, reconnecting"
+                            : "camera: no answer to the connection request (asleep?), disconnecting");
     pairStart = millis();
     client->disconnect();  // onDisconnect goes back to scanning
   }
@@ -330,7 +379,7 @@ void sleep() {
 void wake() {
   if ((ready() && !asleep()) || wakeStart) return;
   if (!known) {
-    Serial.println("camera: not seen since boot, so it can't be woken");
+    Serial.println("camera: never seen, so it can't be woken");
     return;
   }
   uint8_t a[11] = {10, 0xff, 'W', 'K', 'P'};

@@ -440,6 +440,20 @@ button (Q&A #10).
      of the GoPro advertisement), then the start on the camera's first status push, if that comes
      within 30 s. A stop cancels a pending start. The advertisement runs until the camera is back,
      30 s at most. **Tested** from both kinds of sleep; the camera was back within 1–2 s.
+   - The advertisement needs the camera's address, which the bridge keeps in NVS from the last
+     connection. So a camera that sleeps through a bridge reboot can still be woken (**tested**: it
+     woke). Pre-Rec is not armed again then: the bridge doesn't know whether it was armed.
+   - **A sleeping camera keeps advertising and accepts a new connection, but answers nothing on it**
+     (seen after a bridge reboot). Once, service discovery never finished, and the link stayed
+     useless even after the camera woke up, until it dropped 49 s later. Another time, discovery,
+     MTU 500 and the notification subscription worked, but the R SDK connection request got no
+     answer. Awake, the camera answers it within 0.1 s, also before the user taps Accept.
+     So the bridge gives up after 5 s without discovery or 8 s without an answer, waits 30 s before
+     the next try, and while waking the camera tries again from 1.5 s in. **Tested:** the 5 s
+     give-up (the disconnect ends the search with status 0x81, and the link drops with reason 0x16).
+     The 8 s one is not tested yet.
+     A third time, the sleeping camera did not show up in 44 s of scanning at all. ELEMNT record
+     then woke it: found 0.4 s into the wake-up, paired at 3.5 s, recording at 5.5 s (**tested**).
    - If Pre-Rec was armed when the camera fell asleep, the bridge arms it again with a QS press once
      the camera is back and idle, before a pending start. **Tested**, with both wake-ups.
    - Reconnects: after any drop the bridge scans again and redoes the connection request

@@ -15,9 +15,11 @@
 // while it advertises "in pairing mode", like a camera put into pairing mode by hand.
 const char *kName = "GoPro 0042";  // "GoPro" + last 4 digits of the serial, as cameras do
 // ponytail: shown until the camera's first status push; hide the GoPro until then if it misleads.
-uint8_t level = 42;
+uint8_t level = 10;
 bool statusPush = false;  // the ELEMNT registered for status updates (query 0x53)
 bool elemnt = false;      // the ELEMNT is connected
+bool rec = false;         // recording, as the ELEMNT is told: see loop()
+uint16_t recTime = 0;     // the camera's record time, s, while it records
 BLEAdvertisementData advData;  // kept to set it again after the camera's wake-up advertisement
 BLECharacteristic *battery, *cmd, *cmdRsp, *set, *setRsp, *qry, *qryRsp;
 BLE2902 *batteryCccd;
@@ -101,13 +103,13 @@ uint32_t statusValue(uint8_t id, uint8_t &len) {
   switch (id) {
     case 1: return 1;                                                  // internal battery present
     case 2: return level > 66 ? 3 : level > 33 ? 2 : level > 10 ? 1 : 0;  // battery bars
-    case 10: return dji::recording();                                  // encoding active
+    case 10: return rec;                                               // encoding active
     case 33: return 0;                                                 // SD card OK
     case 70: return level;                                             // internal battery %
   }
   len = 4;
   switch (id) {
-    case 13: return dji::recording() ? dji::status.recordTime : 0;  // recording duration, s
+    case 13: return rec ? recTime : 0;                              // recording duration, s
     case 34: return 999;                                            // photos remaining
     case 35: return 7200;                                           // video remaining, s
     case 96: return 1000;                                           // active preset group: video
@@ -261,6 +263,9 @@ class Callbacks : public BLEServerCallbacks {
     Serial.println("ELEMNT connected");
   }
   void onDisconnect(BLEServer *, esp_ble_gatts_cb_param_t *p) override {
+    // reason: 0x08 supervision timeout, 0x13 the other side closed it, 0x16 we did, 0x22 no answer
+    Serial.printf("link %s dropped (reason 0x%02x)\n",
+                  BLEAddress(p->disconnect.remote_bda).toString().c_str(), p->disconnect.reason);
     if (p->disconnect.link_role != 1) return;
     elemnt = false;
     statusPush = false;
@@ -372,19 +377,33 @@ void loop() {
   }
   wasWaking = dji::waking();
 
-  static bool wasRecording = false;
+  // A stop counts once it has held for kStopHold. The camera's pushes come bunched on the slow link,
+  // and after one stop they read stopped, recording, stopped within 120 ms: the ELEMNT's indicator
+  // flickered. The record time freezes meanwhile, so pre-rec's buffered seconds don't show.
+  // ponytail: raise kStopHold if it still flickers; it delays the stop on the ELEMNT by as much.
+  const uint32_t kStopHold = 500;
+  static uint32_t lastRec = 0;  // millis() when the camera last showed a recording
+  static bool raw = false;      // dji::recording() on the last pass
   static uint16_t lastTime = 0;
-  bool rec = dji::recording();
-  uint16_t t = dji::status.recordTime;
-  if (rec != wasRecording) {
-    Serial.printf("camera %s recording\n", rec ? "started" : "stopped");
-    pushStatus(10);
+  bool was = raw;
+  raw = dji::recording();
+  if (raw) {
+    lastRec = millis();
+    recTime = dji::status.recordTime;
+    if (!was && rec) Serial.println("camera recording again right after a stop: ignored the stop");
   }
+  bool now = raw || (rec && millis() - lastRec < kStopHold);
   // The ELEMNT never polls status 13; its timer moves only with these pushes. A GoPro sends a
   // registered status whenever it changes, so this one once a second while recording.
-  if (rec != wasRecording || (rec && t != lastTime)) pushStatus(13);
-  wasRecording = rec;
-  lastTime = t;
+  if (now != rec) {
+    rec = now;
+    Serial.printf("camera %s recording\n", rec ? "started" : "stopped");
+    pushStatus(10);
+    pushStatus(13);
+  } else if (rec && recTime != lastTime) {
+    pushStatus(13);
+  }
+  lastTime = recTime;
 
   uint8_t b = dji::status.battery;  // 0xff until the camera's first status push
   if (b <= 100 && b != level) {
