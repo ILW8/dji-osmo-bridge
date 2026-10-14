@@ -88,6 +88,8 @@ The earlier radar route (name `TRACKR RADAR`, battery only) works too and is kep
    about every 15 s.
 5. It writes setting `0x5B` with value `0x42` from time to time. The meaning is unknown. The bridge answers OK.
 6. Record and stop send command `01 01 01` and `01 01 00`. After a status 10 change it polls 34, 35, 70, 38 and 39.
+   Sleep sends `01 05`, but sometimes several times for one press, 40–600 ms apart (5 and 11 times
+   seen). The second woke the camera again, so the bridge ignores a `05` within 2 s of the last one.
 7. Pairing takes about 10–15 s. The first connect after reflashing can fail bonding with reason `0x66`,
    probably stale keys on the ESP32. The next connect bonds.
 
@@ -223,11 +225,41 @@ The camera's address is kept in NVS, so the ELEMNT can still wake the camera aft
   briefly in the burst, but it clears within about 60 ms.
 - `BLEClient::getService()` and the other BLEClient calls wait with no timeout, and only a
   disconnect ends the wait. A sleeping camera takes the connection and answers nothing, so `loop()`
-  hung for 49 s. The wake-up advertisement then never ended, and the ELEMNT dropped (cause not
-  known; the log now shows each link's disconnect reason). After that, the bridge reconnected to the
+  hung for 49 s. The wake-up advertisement then never ended, and the ELEMNT dropped 3 ms after the
+  camera (see the `GATT_Deregister` item below). After that, the bridge reconnected to the
   camera 4 times a second, and each link dropped as it came up, while the ELEMNT could not get back
   in. `dji.cpp` now disconnects after 5 s with an `esp_timer` and holds off the next attempt.
   Another sleeping camera did answer discovery, but not the R SDK connection request. `dji.cpp`
-  then disconnects after 8 s without any valid frame.
+  then disconnects 5 s after the request without any valid frame.
+  Even with the 5 s give-up, the ELEMNT then couldn't connect, and nRF Connect didn't see the
+  bridge either, until a reset (seen 4 times; reproducible with a camera that just got its
+  battery back). Advertising still reported "on". A camera link lost to a pulled battery (reason
+  0x08) left the advertising working. Dropping the link with `esp_ble_gap_disconnect()` instead of
+  `client->disconnect()` didn't help, and neither did restarting advertising right after the drop.
+  Bluedroid's logging is compiled out (`CONFIG_BT_STACK_NO_LOG`), so the cause is a guess: the
+  camera, still alive, connects back to the bridge and never follows through, which ends
+  advertising in the controller without telling Bluedroid. (DJI's wake-up wants the remote's
+  advertising connectable, so the camera probably connects to its remote itself.) The bridge now
+  restarts its advertising every 5 s while the ELEMNT is away (tested: it came back). The camera's
+  advertisement is the same asleep and awake (`aa 08 15 00 fa <MAC> 00`), so the bridge can't
+  avoid connecting to a sleeping camera.
+- `client->disconnect()` (a GATT close) while service discovery waits for an answer crashed the
+  bridge: a stack overflow in `BTU_TASK`, a recursion between `bta_gattc_sm_execute`,
+  `bta_gattc_cfg_mtu` and `bta_gattc_pop_command_to_send`. The close runs the queued commands. An MTU
+  request then fails (GATT is busy with discovery's unanswered request), and `bta_gattc_cfg_mtu`
+  sends the next queued MTU request again and again, because it is not taken off the queue until it
+  is done. ESP-IDF master still has this code. Bluedroid sends queued commands only while the link exists, so the 5 s
+  watchdog now drops the link with `esp_ble_gap_disconnect()`. To decode a backtrace, rebuild the
+  same sources and run `xtensa-esp32-elf-addr2line -pfiaC -e firmware.elf <addresses>`. The
+  addresses printed are those of the calls.
+- **Every camera disconnect also dropped the ELEMNT** (reason 0x16, 3–7 ms after the camera's
+  link). BLEClient unregisters its GATT app on each disconnect, and Bluedroid's `GATT_Deregister`
+  then closes every link that no app has claimed. The ELEMNT opened its link, so no app had. The
+  bridge now claims the ELEMNT link for its server with `esp_ble_gatts_open()` when the ELEMNT
+  connects; the log shows `GATT ELEMNT link claimed: status 0x91` (tested: the ELEMNT stays).
+- A scan reports each address only once until it is restarted: BLEScan drops repeats, and so does the
+  controller's duplicate filter. So a filter on the advertisement's content gets one chance per scan.
+  After a bridge reset, the bridge once scanned for 60 s without finding the awake camera. The
+  camera we know now counts by its address. The log shows when its advertisement had no DJI data.
 - Timestamps shared between `loop()` and the Bluetooth task run on different cores. Don't make one
   "never 0" with `millis() | 1`: that can be 1 ms in the future, and `millis() - t` then wraps around.

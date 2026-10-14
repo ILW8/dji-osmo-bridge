@@ -448,10 +448,13 @@ button (Q&A #10).
      useless even after the camera woke up, until it dropped 49 s later. Another time, discovery,
      MTU 500 and the notification subscription worked, but the R SDK connection request got no
      answer. Awake, the camera answers it within 0.1 s, also before the user taps Accept.
-     So the bridge gives up after 5 s without discovery or 8 s without an answer, waits 30 s before
-     the next try, and while waking the camera tries again from 1.5 s in. **Tested:** the 5 s
-     give-up (the disconnect ends the search with status 0x81, and the link drops with reason 0x16).
-     The 8 s one is not tested yet.
+     So the bridge gives up after 5 s without discovery or 5 s without an answer to the request,
+     waits 30 s before the next try, and while waking the camera tries again from 1.5 s in.
+     **Tested:** both give-ups (the 5 s discovery one ends the search with status 0x81; both drop
+     the link with reason 0x16). The answer timeout first counted from the start of the attempt
+     (8 s), which left only 4 s once connecting took 1.3 s; it now counts from the request.
+   - A camera that just got its battery back advertises and answers like a sleeping one (the link
+     dropped with reason 0x08 when the battery came out).
      A third time, the sleeping camera did not show up in 44 s of scanning at all. ELEMNT record
      then woke it: found 0.4 s into the wake-up, paired at 3.5 s, recording at 5.5 s (**tested**).
    - If Pre-Rec was armed when the camera fell asleep, the bridge arms it again with a QS press once
