@@ -206,10 +206,14 @@ class Link : public BLEClientCallbacks {
 // then waits for its services forever: loop() hung for 49 s, and with it the end of the wake-up
 // advertisement. The camera woke up meanwhile, but the stuck link never recovered. Disconnecting
 // ends the wait; loop() holds off the next attempt.
+// Not client->disconnect(): closing during discovery made Bluedroid run the queued MTU request,
+// which fails while discovery's own request is unanswered, and bta_gattc_cfg_mtu then retried the
+// next queued MTU request forever (stack overflow in BTU_TASK). Once the link is gone, Bluedroid no
+// longer sends queued requests, so drop the link itself.
 void stalled(void *) {
   sleepy = true;
   Serial.println("camera: connected, but it answers nothing (asleep?), disconnecting");
-  client->disconnect();
+  esp_ble_gap_disconnect(camMac);
 }
 
 void connect() {
@@ -330,7 +334,8 @@ void loop() {
     Serial.println(answered ? "camera: no pairing answer in 30 s, reconnecting"
                             : "camera: no answer to the connection request (asleep?), disconnecting");
     pairStart = millis();
-    client->disconnect();  // onDisconnect goes back to scanning
+    // Like stalled(): a GATT close with a request unanswered is risky in Bluedroid.
+    esp_ble_gap_disconnect(camMac);  // onDisconnect goes back to scanning
   }
 }
 
