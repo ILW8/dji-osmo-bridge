@@ -197,10 +197,18 @@ class GoproWrite : public BLECharacteristicCallbacks {
         dji::record(m[2]);
       } else if (m[0] == 0x05) {  // the Sleep button on the GoPro's page in My Sensors
         // It stays there while the camera sleeps (the ELEMNT can't tell), so it also wakes it.
+        // The ELEMNT sometimes sends one press several times, 40-600 ms apart: the second one woke
+        // the camera again. So a press counts only after 2 s without one.
+        static uint32_t last = 0;  // millis() of the last 05 (this task only)
+        bool repeat = last && millis() - last < 2000;
+        last = millis();
         bool awake = dji::ready() && !dji::asleep();
-        Serial.printf("  SLEEP%s\n", awake ? "" : ": the camera sleeps or is away, waking it");
-        if (awake) dji::sleep();
-        else dji::wake();
+        Serial.printf("  SLEEP%s\n", repeat ? " again: ignored"
+                                     : awake ? "" : ": the camera sleeps or is away, waking it");
+        if (!repeat) {
+          if (awake) dji::sleep();
+          else dji::wake();
+        }
       } else if (m[0] == 0x3c) {  // Get Hardware Info: a HERO12 Black, matching the advertisement
         k += putInt(out + k, 62);                 // model number
         k += putStr(out + k, "HERO12 Black");     // model name
