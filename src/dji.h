@@ -2,6 +2,7 @@
 // The bridge is the central: it scans for the camera, connects, pairs at the protocol level
 // (the user taps Accept on the camera the first time) and subscribes to the status push.
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 
 namespace dji {
@@ -22,5 +23,6 @@ void loop();   // from loop(): scans, connects, pairs and reconnects
 bool ready();  // paired and subscribed to status
 bool recording();
 void record(bool start);
+void sendRaw(uint8_t type, uint8_t set, uint8_t id, const uint8_t *p, size_t n);  // for experiments
 
 }  // namespace dji

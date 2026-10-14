@@ -63,10 +63,13 @@ size_t build(uint8_t *f, uint8_t type, uint8_t set, uint8_t id, const uint8_t *p
 // BLERemoteCharacteristic::writeValue(): that blocks until the write's completion event, which
 // deadlocks in the notify callback and hung in loop() while the camera flooded us with
 // notifications. This call only queues the write, so it works from either task.
+uint32_t lastKey;  // type and command of the last frame from the camera, see onNotify()
+
 void send(uint8_t type, uint8_t set, uint8_t id, const uint8_t *p, size_t n, uint16_t s) {
   uint8_t f[64];
   size_t len = build(f, type, set, id, p, n, s);
   dump("tx", f, len);
+  lastKey = 0;  // always log the reply
   esp_ble_gattc_write_char(client->getGattcIf(), client->getConnId(), tx->getHandle(), len, f,
                            type & 0x1f ? ESP_GATT_WRITE_TYPE_RSP : ESP_GATT_WRITE_TYPE_NO_RSP,
                            ESP_GATT_AUTH_REQ_NONE);
@@ -95,7 +98,6 @@ void onNotify(BLERemoteCharacteristic *, uint8_t *f, size_t len, bool) {
   if (len < 14 || f[0] != 0xaa) return;  // DUML frames (0x55) share this characteristic
   // Log a frame only when it differs in type and command from the one before, so the camera's
   // repeats don't stall this (the Bluetooth) task on Serial.
-  static uint32_t lastKey;
   uint32_t key = f[3] << 16 | f[12] << 8 | f[13];
   bool repeat = key == lastKey;
   lastKey = key;
@@ -231,6 +233,10 @@ void record(bool start) {
   // device_id as DJI's demo sends it (the camera seems not to check it), record_ctrl, reserved.
   const uint8_t p[9] = {0x00, 0x00, 0xff, 0x33, (uint8_t)!start};
   send(0x01, 0x1d, 0x03, p, sizeof p, seq++);
+}
+
+void sendRaw(uint8_t type, uint8_t set, uint8_t id, const uint8_t *p, size_t n) {
+  if (ready() && n <= 46) send(type, set, id, p, n, seq++);  // 46 = room in send()'s frame buffer
 }
 
 }  // namespace dji

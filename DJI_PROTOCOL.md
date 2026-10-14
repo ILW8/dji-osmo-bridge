@@ -294,6 +294,37 @@ Notes:
 - DUML camera-control commands (CmdSet 0x02/0x02) get no reply on similar cameras (osmosis notes).
   Do not use the DUML path for recording.
 
+**Key report values** (`docs/protocol_data_segment.md`): key_code 0x01 Record, 0x02 QS (Quick Switch),
+0x03 SnapShot (from sleep). mode 0x00 = press/release (key_value 0 press, 1 release); mode 0x01 =
+event (key_value 0 short, 1 long, 2 double, 3 triple, 4 quadruple press).
+
+## Pre-Rec on / off: QS key report (tested)
+
+The R SDK has no Pre-Rec command, and DJI's UI spec says the camera starts Pre-Rec itself. But since
+firmware 01.03.02.10 the camera's QS button can be set to start and end Pre-Rec (Control Center →
+Quick Switch Button Settings → Start/End Pre-Rec), and a QS key report acts as a short press of that
+button (Q&A #10).
+
+- **Tested:** with QS set that way, a QS short press toggles Pre-Rec on and off. In 1D02, status
+  0x01 → 0x05 and back:
+
+  ```
+  key report QS, short press: CmdSet 0x00, CmdID 0x11, CmdType 0x01, payload 02 01 00 00
+  ```
+
+- It's a toggle, so check status 0x05 before pressing. It also depends on the camera setting: with
+  QS left at "Switch Between Modes" it would switch modes instead (issue #25, Osmo 360).
+- Pre-Rec works only in Video and SuperNight modes (user manual). On the camera it is enabled from the
+  top-left icon in those modes, where Pre-Rec and Loop Recording share one control.
+
+**Not needed, for reference** (research only, untested):
+- DUML has a camera-settings command, CmdSet 0x02 / CmdID 0x8E (GET `00 <count> <pid u16>`,
+  SET `01 01 <pid u16> <len> <value>`), used over BLE by Moblin and osmosis after a separate
+  Mimo-style pairing (0x07/0x45). A decompile of Mimo 2.12.1 for the Action 5 Pro
+  ([RB14/dji-vcam](https://github.com/RB14/dji-vcam/blob/main/docs/camera-controls.md)) shows it
+  ending Pre-Rec with SET pid 0x003D = 0. No "start Pre-Rec" setter was found. Frame format and CRCs:
+  [osmosis MEDIA_PROTOCOL.md](https://github.com/KonradIT/osmosis/blob/main/MEDIA_PROTOCOL.md).
+
 ## Other battery sources (not needed)
 
 - **DUML push** (SOF 0x55) on the same `0xFFF4`: CmdSet 0x0D / CmdID 0x02, about 1 Hz, percent
@@ -354,6 +385,7 @@ Notes:
 
 - Whether `1D03`'s device_id field matters (the demo's value works).
 - Whether a `1D03` start in Photo mode takes a photo.
+- Whether Pre-Rec survives a `1D04` mode switch or sleep.
 - Minimum Action 5 Pro firmware.
 - The exact `1D02` push rate.
 - Whether the camera stores the pairing under mac, device_id or the BLE address.
