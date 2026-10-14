@@ -263,6 +263,7 @@ void connect() {
   uint16_t code = random(10000);
   p[27] = code;
   p[28] = code >> 8;
+  pairStart = millis();  // again: the timeouts in loop() count from the request
   send(0x02, 0x00, 0x19, p, sizeof p, seq++);
   Serial.println("camera: tap Accept on the camera if it asks");
 }
@@ -327,9 +328,10 @@ void loop() {
     BLEDevice::getScan()->start(0, nullptr, false);  // until Found stops it
   } else if (state == kFound) {
     connect();
-  } else if (state == kPairing && millis() - pairStart > (answered ? 30000 : 8000)) {
-    // An awake camera answers the connection request (sent ~3 s in) within 0.1 s, also before the
-    // user taps Accept. A sleeping one may answer everything else on the link, but not that.
+  } else if (state == kPairing && millis() - pairStart > (answered ? 30000 : 5000)) {
+    // An awake camera answers the connection request within 0.1 s, also before the user taps
+    // Accept. A sleeping one may answer everything else on the link, but not that. (The request
+    // went out 4 s into one attempt, where connecting took 1.3 s: so count from the request.)
     sleepy = !answered;
     Serial.println(answered ? "camera: no pairing answer in 30 s, reconnecting"
                             : "camera: no answer to the connection request (asleep?), disconnecting");
