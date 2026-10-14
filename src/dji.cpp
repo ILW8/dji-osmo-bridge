@@ -182,11 +182,17 @@ void onNotify(BLERemoteCharacteristic *, uint8_t *f, size_t len, bool) {
 }
 
 class Found : public BLEAdvertisedDeviceCallbacks {
+  // The scan reports each address once (BLEScan and the controller both drop repeats), so a camera
+  // whose first advertisement fails the DJI check is never seen again in that scan. After a bridge
+  // reset, the bridge once scanned for 60 s without finding the awake camera. So the camera we
+  // know counts by its address, whatever it advertises.
   void onResult(BLEAdvertisedDevice d) override {
+    if (state != kScanning) return;
     std::string m = d.getManufacturerData();  // DJI: AA 08 <model, 2> FA <MAC, 6>
-    if (state != kScanning || m.size() < 5 || (uint8_t)m[0] != 0xaa || m[1] != 0x08 ||
-        (uint8_t)m[4] != 0xfa)
-      return;
+    bool dji = m.size() >= 5 && (uint8_t)m[0] == 0xaa && m[1] == 0x08 && (uint8_t)m[4] == 0xfa;
+    if (!dji && !(known && !memcmp(*d.getAddress().getNative(), camMac, 6))) return;
+    if (!dji) Serial.printf("camera: its advertisement has no DJI data (%u bytes)\n",
+                            d.getPayloadLength());
     BLEDevice::getScan()->stop();
     delete camera;
     camera = new BLEAdvertisedDevice(d);
